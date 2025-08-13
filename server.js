@@ -21,7 +21,7 @@ app.use((req, res, next) => {
 });
 
 /* ENV */
-const PORT          = process.env.PORT;                    // Render injeta (NADA de || 10000)
+const PORT          = process.env.PORT;                    // Render injeta (SEM fallback)
 const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN || "";
 const ESP32_URL     = process.env.ESP32_URL || "";
 const PRICE_CENTS   = Number(process.env.PRICE_CENTS ?? 800); // 800 = R$ 8,00
@@ -88,6 +88,6 @@ app.post("/webhook", async (req, res) => {
 });
 
 /* Start */
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Servidor na porta ${PORT} | PRICE_CENTS=${PRICE_CENTS}`);
+app.listen(process.env.PORT, "0.0.0.0", () => {
+  console.log(`Servidor na porta ${process.env.PORT} | PRICE_CENTS=${PRICE_CENTS}`);
 });
