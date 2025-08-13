@@ -1,98 +1,100 @@
-// server.js
+// server.js (PagBank → Webhook → ESP32) — valor fixo R$ 8,00 por padrão
 const express = require("express");
-const crypto = require("crypto");
-const fetch = (...args) => import("node-fetch").then(({default: f}) => f(...args));
+const crypto  = require("crypto");
 
 const app = express();
 
-// Captura o corpo cru p/ validar a assinatura
+// ===== Middlewares =====
 app.use(express.json({
-  verify: (req, res, buf) => { req.rawBody = buf.toString("utf8"); }
+  verify: (req, _res, buf) => { req.rawBody = buf.toString("utf8"); }
 }));
 
-const PORT = process.env.PORT || 10000;
-const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN || ""; // Token da sua conta (iBanking)
-const ESP32_URL = process.env.ESP32_URL || "http://192.168.0.50/unlock";
-const ESP32_TOKEN = process.env.ESP32_TOKEN || "";
-
-// idempotência simples
-const processed = new Set();
-
-function checkSignature(rawBody, headerSig) {
-  if (!PAGBANK_TOKEN || !headerSig) return false;
-  const expected = crypto.createHash("sha256")
-    .update(`${PAGBANK_TOKEN}-${rawBody}`, "utf8")
-    .digest("hex");
-  return expected === headerSig;
-}
-
-async function openTap({ referenceId, amount, endToEndId }) {
-  const res = await fetch(ESP32_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      action: "OPEN_TAP",
-      referenceId,
-      amount,        // em centavos
-      endToEndId,
-      token: ESP32_TOKEN || undefined
-    })
-  });
-  if (!res.ok) throw new Error(`ESP32 falhou: ${res.status}`);
-}
-
-// Healthcheck
-app.get("/", (req, res) => res.send("OK - webhook online"));
-
-// Webhook PagBank
-app.post("/pagbank/webhook", async (req, res) => {
-  const sig = req.get("x-authenticity-token") || "";
-
-  // 1) valida assinatura
-  if (!checkSignature(req.rawBody || "", sig)) {
-    console.warn("Assinatura inválida");
-    return res.sendStatus(401);
-  }
-
-  const body = req.body || {};
-  const charge = body?.charges?.[0];
-  const status = charge?.status;
-  const method = charge?.payment_method?.type;
-  const e2e = charge?.payment_method?.pix?.end_to_end_id;
-  const amount = charge?.amount?.value;
-  const referenceId = body?.reference_id || charge?.reference_id || body?.id;
-  const dedup = charge?.payment_method?.pix?.notification_id || charge?.id || body?.id;
-
-  console.log("[Webhook]", { status, method, referenceId, amount });
-
-  if (dedup && processed.has(dedup)) {
-    return res.json({ ok: true, duplicated: true });
-  }
-
-  if (status === "PAID" && method === "PIX") {
-    if (dedup) processed.add(dedup);
-    try {
-      await openTap({ referenceId, amount, endToEndId: e2e });
-      console.log("[Torneira] Liberada:", referenceId);
-      return res.json({ ok: true });
-    } catch (e) {
-      console.error("Falha ESP32:", e);
-      // responde 200 para o PagBank não reenviar sem fim
-      return res.status(200).json({ ok: false, esp32: true });
-    }
-  }
-
-  return res.json({ ok: true, ignored: true });
+// (Opcional) CORS simples
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-authenticity-token");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
 });
 
-// Endpoint de teste manual para a torneira
-app.post("/tap/test", async (req, res) => {
+// ===== Env =====
+const PORT           = process.env.PORT;                    // Render injeta
+const PAGBANK_TOKEN  = process.env.PAGBANK_TOKEN || "";     // iBanking → Integrações → Token
+const ESP32_URL      = process.env.ESP32_URL || "";         // ex.: http://192.168.0.50/unlock
+const PRICE_CENTS    = Number(process.env.PRICE_CENTS ?? 800); // *** R$ 8,00 ***
+
+// ===== Rotas básicas =====
+app.get("/", (_req, res) => res.send("OK - webhook online"));
+app.get("/healthz", (_req, res) => res.send("ok"));
+
+// (Opcional) teste manual de liberação
+app.post("/test/unlock", async (_req, res) => {
   try {
-    await openTap({ referenceId: "TESTE_LOCAL", amount: 1000, endToEndId: "LOCAL" });
-    res.json({ ok: true });
+    const fetch = global.fetch || (await import("node-fetch")).default;
+    if (!ESP32_URL) return res.status(400).send("Defina ESP32_URL no Environment");
+    const r = await fetch(ESP32_URL, { method: "POST" });
+    return res.status(200).send(`POST ${ESP32_URL} => ${r.status}`);
   } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    console.error("Erro /test/unlock:", e);
+    return res.status(500).send(String(e));
   }
 });
 
-app.listen(PORT, () => console.log("Servidor na porta", PORT));
+// ===== Webhook PagBank =====
+const processed = new Set(); // evita processar o mesmo pagamento 2x
+
+app.post("/webhook", async (req, res) => {
+  const sig = req.get("x-authenticity-token") || "";
+  const raw = req.rawBody || "";
+
+  // assinatura: sha256(PAGBANK_TOKEN + "-" + corpoCru)
+  const calc = crypto.createHash("sha256")
+    .update(`${PAGBANK_TOKEN}-${raw}`)
+    .digest("hex");
+
+  if (calc !== sig) {
+    console.warn("Assinatura inválida");
+    return res.status(401).send("invalid signature");
+  }
+
+  try {
+    const evt    = req.body;
+    const charge = evt?.charges?.[0];
+    const status = charge?.status;                // esperado: "PAID"
+    const cents  = Number(charge?.amount?.value); // centavos recebidos
+    const evtId  = evt?.id || charge?.id;
+
+    if (!evtId || processed.has(evtId)) return res.sendStatus(200);
+
+    const methodType = (charge?.payment_method?.type || "").toUpperCase();
+
+    // *** Libera somente PIX pago e com o valor exato configurado ***
+    if (status === "PAID" && cents === PRICE_CENTS && methodType === "PIX") {
+      processed.add(evtId);
+      try {
+        const fetch = global.fetch || (await import("node-fetch")).default;
+        if (!ESP32_URL) {
+          console.error("ESP32_URL não definida no Environment");
+        } else {
+          await fetch(ESP32_URL, { method: "POST" });
+          console.log(`✅ ESP32 liberado | evt=${evtId} | valor=${cents}`);
+        }
+      } catch (e) {
+        console.error("Erro ao chamar ESP32:", e);
+      }
+    } else {
+      console.log("Evento ignorado:", { status, cents, methodType, required: PRICE_CENTS });
+    }
+
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error("Erro webhook:", e);
+    return res.sendStatus(500);
+  }
+});
+
+// ===== Start =====
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Servidor na porta ${PORT} | PRICE_CENTS=${PRICE_CENTS}`);
+});
